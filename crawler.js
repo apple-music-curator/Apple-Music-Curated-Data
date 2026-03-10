@@ -207,38 +207,179 @@ async function logDomSizeDebug(page, tag = '') {
 
 async function scrollUntilExhausted(page, direction = 'vertical') {
   if (direction === 'vertical') {
-    const vp = page.viewportSize() || { width: 1280, height: 720 };
-    await page.mouse.move(Math.floor(vp.width * 0.5), Math.floor(vp.height * 0.5));
+    const before = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('*'));
+      const vEls = all.filter(el => el.scrollHeight > el.clientHeight + 20);
+      return {
+        x: window.scrollX,
+        y: window.scrollY,
+        sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+        sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+        verticalScrollableEls: vEls.length,
+      };
+    });
 
-    const before = await page.evaluate(() => ({
+    // find biggest vertical scroller and scroll it
+    const movedStats = await page.evaluate(async () => {
+      const delay = (ms) => new Promise(r => setTimeout(r, ms));
+      const all = Array.from(document.querySelectorAll('*'));
+
+      const vertical = all
+        .filter(el => el.scrollHeight > el.clientHeight + 20)
+        .map(el => ({
+          el,
+          room: el.scrollHeight - el.clientHeight,
+          area: el.clientHeight * el.clientWidth
+        }))
+        .sort((a, b) => (b.room * 10 + b.area) - (a.room * 10 + a.area));
+
+      let totalMoves = 0;
+      let targetsUsed = 0;
+
+      // try top candidates (usually app-root scroller is near top of this sorted list)
+      for (const candidate of vertical.slice(0, 8)) {
+        const el = candidate.el;
+        let stagnant = 0;
+        let last = el.scrollTop;
+        let movedOnThisEl = 0;
+        targetsUsed++;
+
+        for (let i = 0; i < 35; i++) {
+          el.scrollTop = Math.min(el.scrollTop + Math.max(700, Math.floor(el.clientHeight * 0.9)), el.scrollHeight);
+          await delay(180);
+          const cur = el.scrollTop;
+          if (cur === last) {
+            stagnant++;
+            if (stagnant >= 3) break;
+          } else {
+            movedOnThisEl++;
+            stagnant = 0;
+            last = cur;
+          }
+        }
+
+        totalMoves += movedOnThisEl;
+        // reset to top for consistent extraction behavior
+        el.scrollTop = 0;
+
+        // if we found a working scroller, no need to brute-force all
+        if (movedOnThisEl > 2) break;
+      }
+
+      return { totalMoves, targetsUsed, verticalCandidates: vertical.length };
+    });
+
+    const after = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('*'));
+      const vEls = all.filter(el => el.scrollHeight > el.clientHeight + 20);
+      return {
+        x: window.scrollX,
+        y: window.scrollY,
+        sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+        sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+        verticalScrollableEls: vEls.length,
+      };
+    });
+
+    console.log(
+      `[DEBUG_SCROLL] dir=vertical before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},vScrollEls=${before.verticalScrollableEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},vScrollEls=${after.verticalScrollableEls}) moved=${movedStats.totalMoves} targetsUsed=${movedStats.targetsUsed}/${movedStats.verticalCandidates}`
+    );
+    return;
+  }
+
+  // horizontal branch unchanged logic style, but also container-first
+  const before = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll('*'));
+    const hEls = all.filter(el => el.scrollWidth > el.clientWidth + 20);
+    return {
       x: window.scrollX,
       y: window.scrollY,
       sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
       sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
-      hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
-    }));
+      hScrollEls: hEls.length,
+    };
+  });
 
-    let stagnant = 0;
-    let last = await page.evaluate(() => window.scrollY);
+  const shelfSelector = '[data-testid*="section" i], [data-testid*="shelf" i], [class*="shelf" i], [class*="carousel" i], section, [role="region"]';
+  const shelves = page.locator(shelfSelector);
+  const shelfCount = await shelves.count();
 
-    for (let i = 0; i < 30; i++) {
-      await page.mouse.wheel(0, 950);
-      await page.waitForTimeout(300);
+  let totalCenterHovers = 0;
+  let totalRightEdgeMoves = 0;
+  let totalArrowClicks = 0;
 
-      const cur = await page.evaluate(() => window.scrollY);
-      if (cur === last) {
-        stagnant++;
-        await page.evaluate(() => window.scrollBy(0, 900));
-        await page.waitForTimeout(200);
-        const cur2 = await page.evaluate(() => window.scrollY);
-        if (cur2 === last && stagnant >= 3) break;
-        last = cur2;
-      } else {
-        stagnant = 0;
-        last = cur;
+  for (let i = 0; i < shelfCount; i++) {
+    const shelf = shelves.nth(i);
+    try {
+      await shelf.scrollIntoViewIfNeeded();
+      const box = await shelf.boundingBox();
+      if (!box || box.width < 200 || box.height < 60) continue;
+
+      const cx = Math.floor(box.x + box.width * 0.5);
+      const cy = Math.floor(box.y + box.height * 0.5);
+      await page.mouse.move(cx, cy, { steps: 8 });
+      totalCenterHovers++;
+      await page.waitForTimeout(120);
+
+      const rx = Math.floor(box.x + box.width - 8);
+      await page.mouse.move(rx, cy, { steps: 10 });
+      totalRightEdgeMoves++;
+      await page.waitForTimeout(120);
+
+      for (let k = 0; k < 10; k++) {
+        const rightArrow = shelf.locator(
+          [
+            'button[aria-label*="Next" i]',
+            'button[title*="Next" i]',
+            'button[aria-label*="more" i]',
+            '[data-testid*="next" i]',
+            'button[class*="next" i]',
+            '[class*="next" i] button',
+          ].join(', ')
+        ).first();
+
+        if (!(await rightArrow.count())) break;
+        const disabled = (await rightArrow.getAttribute('aria-disabled')) === 'true';
+        if (disabled) break;
+
+        const arrowBox = await rightArrow.boundingBox();
+        if (!arrowBox) break;
+
+        await page.mouse.move(Math.floor(arrowBox.x + arrowBox.width / 2), Math.floor(arrowBox.y + arrowBox.height / 2), { steps: 4 });
+        await rightArrow.click({ timeout: 900 });
+        totalArrowClicks++;
+        await page.waitForTimeout(220);
       }
-    }
+    } catch {}
+  }
 
+  const fallback = await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20);
+    let moved = 0;
+    for (const el of els) {
+      const before = el.scrollLeft;
+      el.scrollLeft = Math.min(el.scrollLeft + Math.max(450, Math.floor(el.clientWidth * 0.9)), el.scrollWidth);
+      if (el.scrollLeft !== before) moved++;
+    }
+    return { total: els.length, moved };
+  });
+
+  const after = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll('*'));
+    const hEls = all.filter(el => el.scrollWidth > el.clientWidth + 20);
+    return {
+      x: window.scrollX,
+      y: window.scrollY,
+      sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+      sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+      hScrollEls: hEls.length,
+    };
+  });
+
+  console.log(
+    `[DEBUG_SCROLL] dir=horizontal before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},hScrollEls=${before.hScrollEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},hScrollEls=${after.hScrollEls}) shelves=${shelfCount} centerHovers=${totalCenterHovers} rightEdgeMoves=${totalRightEdgeMoves} arrowClicks=${totalArrowClicks} fallbackMoves=${fallback.moved}/${fallback.total}`
+  );
+}
     await page.evaluate(() => window.scrollTo(0, 0));
 
     const after = await page.evaluate(() => ({
