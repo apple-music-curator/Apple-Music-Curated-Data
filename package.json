@@ -1,0 +1,19 @@
+{
+  "name": "apple-music-us-crawler",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Apple Music crawler with staged parallel workflows",
+  "main": "crawler.js",
+  "scripts": {
+    "crawl": "node crawler.js",
+    "crawl:orchestrator": "node crawler.js --mode orchestrator",
+    "crawl:merge": "node crawler.js --mode merge --merge-glob \"data/outputs/*.json\" --out data/us.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "glob": "^10.4.5",
+    "playwright": "^1.53.0"
+  }
+}
