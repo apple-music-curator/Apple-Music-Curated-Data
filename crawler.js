@@ -14,6 +14,7 @@ const path = require('path');
  * - Verbose skip diagnostics: logs why each page is skipped
  * - Logs subtitle for each crawled page
  * - EXTRA DEBUG LOGS ADDED:
+ *   - DOM-size readiness diagnostics
  *   - scroll diagnostics
  *   - links found per page
  *   - links opened/queued counters
@@ -159,6 +160,51 @@ async function safeGoto(page, url, timeout = PAGE_TIMEOUT) {
   }
 }
 
+async function waitForAppleMusicAppReady(page) {
+  await page.waitForTimeout(1500);
+
+  const selectors = [
+    '[data-testid="section-container"]',
+    '[class*="headings__title"]',
+    'a[href*="music.apple.com/us/"]',
+    '[class*="shelf"]',
+    '[class*="carousel"]',
+  ];
+
+  for (const sel of selectors) {
+    try {
+      await page.waitForSelector(sel, { timeout: 6000, state: 'attached' });
+      return;
+    } catch {}
+  }
+
+  await page.waitForTimeout(2500);
+}
+
+async function logDomSizeDebug(page, tag = '') {
+  const s = await page.evaluate(() => {
+    const de = document.documentElement;
+    const b = document.body;
+    return {
+      innerW: window.innerWidth,
+      innerH: window.innerHeight,
+      pageXOffset: window.pageXOffset,
+      pageYOffset: window.pageYOffset,
+      deScrollH: de?.scrollHeight || 0,
+      deClientH: de?.clientHeight || 0,
+      deScrollW: de?.scrollWidth || 0,
+      deClientW: de?.clientWidth || 0,
+      bodyScrollH: b?.scrollHeight || 0,
+      bodyClientH: b?.clientHeight || 0,
+      bodyScrollW: b?.scrollWidth || 0,
+      bodyClientW: b?.clientWidth || 0,
+      sectionCount: document.querySelectorAll('[data-testid="section-container"]').length,
+      linkCount: document.querySelectorAll('a[href*="music.apple.com/us/"]').length,
+    };
+  });
+  console.log(`[DEBUG_DOM_SIZE] ${tag} ${JSON.stringify(s)}`);
+}
+
 async function scrollUntilExhausted(page, direction = 'vertical') {
   if (direction === 'vertical') {
     const vp = page.viewportSize() || { width: 1280, height: 720 };
@@ -209,7 +255,6 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
     return;
   }
 
-  // Horizontal: hover center -> move right edge -> click arrow
   const before = await page.evaluate(() => ({
     x: window.scrollX,
     y: window.scrollY,
@@ -233,21 +278,18 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
       const box = await shelf.boundingBox();
       if (!box || box.width < 200 || box.height < 60) continue;
 
-      // Move to vertical center of container
       const cx = Math.floor(box.x + box.width * 0.5);
       const cy = Math.floor(box.y + box.height * 0.5);
       await page.mouse.move(cx, cy, { steps: 8 });
       totalCenterHovers++;
       await page.waitForTimeout(120);
 
-      // Move to right edge of container
       const rx = Math.floor(box.x + box.width - 8);
       const ry = cy;
       await page.mouse.move(rx, ry, { steps: 10 });
       totalRightEdgeMoves++;
       await page.waitForTimeout(120);
 
-      // Click right arrow repeatedly
       for (let k = 0; k < 10; k++) {
         const rightArrow = shelf.locator(
           [
@@ -268,7 +310,6 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
         const arrowBox = await rightArrow.boundingBox();
         if (!arrowBox) break;
 
-        // Keep pointer near right edge and click arrow center
         await page.mouse.move(Math.floor(box.x + box.width - 6), cy, { steps: 4 });
         await page.mouse.move(
           Math.floor(arrowBox.x + arrowBox.width / 2),
@@ -283,7 +324,6 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
     } catch {}
   }
 
-  // Fallback: direct horizontal movement in scrollable elements
   const fallback = await page.evaluate(() => {
     const els = Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20);
     let moved = 0;
@@ -497,9 +537,12 @@ async function crawlPage(page, url) {
     };
   }
 
-  await page.waitForTimeout(1200);
+  await waitForAppleMusicAppReady(page);
+  await logDomSizeDebug(page, `before-scroll url=${url}`);
   await scrollUntilExhausted(page, 'vertical');
   await scrollUntilExhausted(page, 'horizontal');
+  await page.waitForTimeout(800);
+  await logDomSizeDebug(page, `after-scroll url=${url}`);
 
   const x = await extractLinksSectionsAndTracks(page, pageType);
   return { ...x, navOk: true, pageType };
