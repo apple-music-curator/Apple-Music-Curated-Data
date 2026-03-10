@@ -13,12 +13,16 @@ const path = require('path');
  * - Includes multi-room seed and set-list playlist track scraping
  * - Verbose skip diagnostics: logs why each page is skipped
  * - Logs subtitle for each crawled page
- * - EXTRA DEBUG LOGS ADDED (without removing/changing existing logs):
+ * - EXTRA DEBUG LOGS ADDED:
  *   - scroll diagnostics
  *   - links found per page
  *   - links opened/queued counters
  *   - Apple Music kept-item counters
- *   - multiline progress block: one metric per line
+ *   - multiline progress block (one metric per line)
+ * - Horizontal scrolling interaction:
+ *   - move mouse to vertical center of row
+ *   - move to right edge
+ *   - click right-arrow button repeatedly
  */
 
 const SEED_URLS = [
@@ -32,14 +36,14 @@ const MAX_DEPTH = 4;
 const MAX_QUEUE_SIZE = 10000;
 const MAX_TRACKS_PER_ITEM = 500;
 
-// Tuned concurrency/pacing (as requested earlier)
+// Tuned concurrency/pacing
 const MAX_BROWSERS = 4;
 const PARALLEL_PER_BROWSER = 2;
 const PAGE_TIMEOUT = 45000;
 const DELAY_BETWEEN_PAGES = 600;
 const NAV_RETRY_BACKOFF_MS = 2500;
 
-// Conservative throttle detector (trip earlier, cool off longer)
+// Conservative throttle detector
 const THROTTLE_WINDOW_SIZE = 40;
 const THROTTLE_FAIL_THRESHOLD = 0.45;
 const THROTTLE_MIN_ATTEMPTS = 20;
@@ -156,69 +160,151 @@ async function safeGoto(page, url, timeout = PAGE_TIMEOUT) {
 }
 
 async function scrollUntilExhausted(page, direction = 'vertical') {
-  const before = await page.evaluate((dir) => {
-    const sx = window.scrollX;
-    const sy = window.scrollY;
-    const sh = Math.max(
-      document.body?.scrollHeight || 0,
-      document.documentElement?.scrollHeight || 0
-    );
-    const sw = Math.max(
-      document.body?.scrollWidth || 0,
-      document.documentElement?.scrollWidth || 0
-    );
-    const horizontalScrollableCount = Array.from(document.querySelectorAll('*'))
-      .filter(el => el.scrollWidth > el.clientWidth + 20).length;
-    return { dir, sx, sy, sh, sw, horizontalScrollableCount };
-  }, direction);
+  if (direction === 'vertical') {
+    const vp = page.viewportSize() || { width: 1280, height: 720 };
+    await page.mouse.move(Math.floor(vp.width * 0.5), Math.floor(vp.height * 0.5));
 
-  await page.evaluate(async (dir) => {
-    const delay = 700;
-    const max = 25;
-    let last = dir === 'vertical' ? window.scrollY : window.scrollX;
-    let same = 0;
+    const before = await page.evaluate(() => ({
+      x: window.scrollX,
+      y: window.scrollY,
+      sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+      sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+      hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
+    }));
 
-    for (let i = 0; i < max; i++) {
-      if (dir === 'vertical') window.scrollBy(0, 900);
-      else {
-        const containers = document.querySelectorAll('[style*="overflow-x"], .shelf-grid, [class*="carousel"]');
-        for (const c of containers) c.scrollBy({ left: 450, behavior: 'smooth' });
-        window.scrollBy({ left: 450, top: 0, behavior: 'smooth' });
-      }
+    let stagnant = 0;
+    let last = await page.evaluate(() => window.scrollY);
 
-      await new Promise(r => setTimeout(r, delay));
-      const cur = dir === 'vertical' ? window.scrollY : window.scrollX;
+    for (let i = 0; i < 30; i++) {
+      await page.mouse.wheel(0, 950);
+      await page.waitForTimeout(300);
+
+      const cur = await page.evaluate(() => window.scrollY);
       if (cur === last) {
-        same++;
-        if (same >= 3) break;
+        stagnant++;
+        await page.evaluate(() => window.scrollBy(0, 900));
+        await page.waitForTimeout(200);
+        const cur2 = await page.evaluate(() => window.scrollY);
+        if (cur2 === last && stagnant >= 3) break;
+        last = cur2;
       } else {
-        same = 0;
+        stagnant = 0;
+        last = cur;
       }
-      last = cur;
     }
 
-    if (dir === 'vertical') window.scrollTo(0, 0);
-  }, direction);
+    await page.evaluate(() => window.scrollTo(0, 0));
 
-  const after = await page.evaluate((dir) => {
-    const sx = window.scrollX;
-    const sy = window.scrollY;
-    const sh = Math.max(
-      document.body?.scrollHeight || 0,
-      document.documentElement?.scrollHeight || 0
-    );
-    const sw = Math.max(
-      document.body?.scrollWidth || 0,
-      document.documentElement?.scrollWidth || 0
-    );
-    const horizontalScrollableCount = Array.from(document.querySelectorAll('*'))
-      .filter(el => el.scrollWidth > el.clientWidth + 20).length;
-    return { dir, sx, sy, sh, sw, horizontalScrollableCount };
-  }, direction);
+    const after = await page.evaluate(() => ({
+      x: window.scrollX,
+      y: window.scrollY,
+      sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+      sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+      hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
+    }));
 
-  // ADDED debug log (new, does not replace existing logs)
+    console.log(
+      `[DEBUG_SCROLL] dir=vertical before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},hScrollEls=${before.hScrollEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},hScrollEls=${after.hScrollEls})`
+    );
+    return;
+  }
+
+  // Horizontal: hover center -> move right edge -> click arrow
+  const before = await page.evaluate(() => ({
+    x: window.scrollX,
+    y: window.scrollY,
+    sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+    sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+    hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
+  }));
+
+  const shelfSelector = '[data-testid*="section" i], [data-testid*="shelf" i], [class*="shelf" i], [class*="carousel" i], section, [role="region"]';
+  const shelves = page.locator(shelfSelector);
+  const shelfCount = await shelves.count();
+
+  let totalCenterHovers = 0;
+  let totalRightEdgeMoves = 0;
+  let totalArrowClicks = 0;
+
+  for (let i = 0; i < shelfCount; i++) {
+    const shelf = shelves.nth(i);
+    try {
+      await shelf.scrollIntoViewIfNeeded();
+      const box = await shelf.boundingBox();
+      if (!box || box.width < 200 || box.height < 60) continue;
+
+      // Move to vertical center of container
+      const cx = Math.floor(box.x + box.width * 0.5);
+      const cy = Math.floor(box.y + box.height * 0.5);
+      await page.mouse.move(cx, cy, { steps: 8 });
+      totalCenterHovers++;
+      await page.waitForTimeout(120);
+
+      // Move to right edge of container
+      const rx = Math.floor(box.x + box.width - 8);
+      const ry = cy;
+      await page.mouse.move(rx, ry, { steps: 10 });
+      totalRightEdgeMoves++;
+      await page.waitForTimeout(120);
+
+      // Click right arrow repeatedly
+      for (let k = 0; k < 10; k++) {
+        const rightArrow = shelf.locator(
+          [
+            'button[aria-label*="Next" i]',
+            'button[title*="Next" i]',
+            'button[aria-label*="more" i]',
+            '[data-testid*="next" i]',
+            'button[class*="next" i]',
+            '[class*="next" i] button',
+          ].join(', ')
+        ).first();
+
+        if (!(await rightArrow.count())) break;
+
+        const disabled = (await rightArrow.getAttribute('aria-disabled')) === 'true';
+        if (disabled) break;
+
+        const arrowBox = await rightArrow.boundingBox();
+        if (!arrowBox) break;
+
+        // Keep pointer near right edge and click arrow center
+        await page.mouse.move(Math.floor(box.x + box.width - 6), cy, { steps: 4 });
+        await page.mouse.move(
+          Math.floor(arrowBox.x + arrowBox.width / 2),
+          Math.floor(arrowBox.y + arrowBox.height / 2),
+          { steps: 4 }
+        );
+
+        await rightArrow.click({ timeout: 900 });
+        totalArrowClicks++;
+        await page.waitForTimeout(220);
+      }
+    } catch {}
+  }
+
+  // Fallback: direct horizontal movement in scrollable elements
+  const fallback = await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20);
+    let moved = 0;
+    for (const el of els) {
+      const before = el.scrollLeft;
+      el.scrollLeft = Math.min(el.scrollLeft + Math.max(450, Math.floor(el.clientWidth * 0.9)), el.scrollWidth);
+      if (el.scrollLeft !== before) moved++;
+    }
+    return { total: els.length, moved };
+  });
+
+  const after = await page.evaluate(() => ({
+    x: window.scrollX,
+    y: window.scrollY,
+    sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+    sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
+    hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
+  }));
+
   console.log(
-    `[DEBUG_SCROLL] dir=${direction} before(x=${before.sx},y=${before.sy},sh=${before.sh},sw=${before.sw},hScrollEls=${before.horizontalScrollableCount}) after(x=${after.sx},y=${after.sy},sh=${after.sh},sw=${after.sw},hScrollEls=${after.horizontalScrollableCount})`
+    `[DEBUG_SCROLL] dir=horizontal before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},hScrollEls=${before.hScrollEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},hScrollEls=${after.hScrollEls}) shelves=${shelfCount} centerHovers=${totalCenterHovers} rightEdgeMoves=${totalRightEdgeMoves} arrowClicks=${totalArrowClicks} fallbackMoves=${fallback.moved}/${fallback.total}`
   );
 }
 
@@ -490,7 +576,6 @@ async function main() {
 
       const { url, depth } = task;
 
-      // ADDED debug: opened attempt count
       state.debug.totalLinksOpenedAttempted++;
       console.log(`[DEBUG_OPEN_ATTEMPT] openedAttempt=${state.debug.totalLinksOpenedAttempted} url=${url} depth=${depth}`);
 
@@ -527,7 +612,6 @@ async function main() {
 
         pageCount++;
 
-        // ADDED debug: links found on this page + running sum
         const linksFoundThisPage = (x.links || []).length;
         state.debug.totalLinksFoundAcrossPages += linksFoundThisPage;
         console.log(`[DEBUG_LINKS_FOUND] url=${url} linksFoundThisPage=${linksFoundThisPage} linksFoundTotal=${state.debug.totalLinksFoundAcrossPages}`);
@@ -602,7 +686,7 @@ async function main() {
           const totalTracks = items.reduce((s, i) => s + (i.tracks?.length || 0), 0);
           const ts = throttle.stats();
 
-          // KEEP EXISTING LOGS (unchanged)
+          // Existing logs preserved
           console.log(
             `[PROGRESS] pages=${pageCount} queue=${queue.length}/${MAX_QUEUE_SIZE} items=${items.length} tracks=${totalTracks} failRate=${ts.failRate.toFixed(2)} (${ts.fails}/${ts.attempts})`
           );
@@ -610,7 +694,7 @@ async function main() {
             `[SKIP-STATS] duplicateVisited=${state.skipStats.duplicateVisited} typeFiltered=${state.skipStats.typeFiltered} navFailed=${state.skipStats.navFailed} keepRuleRejected=${state.skipStats.keepRuleRejected} emptyContent=${state.skipStats.emptyContent} queueCapDropped=${state.skipStats.queueCapDropped}`
           );
 
-          // ADDED multiline block (one metric per line)
+          // Added multiline block
           console.log(`[DEBUG_PROGRESS_MULTI]`);
           console.log(`Pages Crawled: ${pageCount}`);
           console.log(`Queue: ${queue.length}/${MAX_QUEUE_SIZE}`);
