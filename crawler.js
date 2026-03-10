@@ -2,30 +2,6 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-/**
- * Apple Music US Crawler (enhanced diagnostics + broader coverage)
- * - Crawl-only (no artist search pipeline)
- * - No radio seeds
- * - No radio pages/items
- * - Album rule: do NOT parse album tracklist; only use album page sections/featured links
- * - Depth = 4 (broader reach for Set Lists / Essentials)
- * - Conservative throttle detector
- * - Includes multi-room seed and set-list playlist track scraping
- * - Verbose skip diagnostics: logs why each page is skipped
- * - Logs subtitle for each crawled page
- * - EXTRA DEBUG LOGS ADDED:
- *   - DOM-size readiness diagnostics
- *   - scroll diagnostics
- *   - links found per page
- *   - links opened/queued counters
- *   - Apple Music kept-item counters
- *   - multiline progress block (one metric per line)
- * - Horizontal scrolling interaction:
- *   - move mouse to vertical center of row
- *   - move to right edge
- *   - click right-arrow button repeatedly
- */
-
 const SEED_URLS = [
   'https://music.apple.com/us/top-charts',
   'https://music.apple.com/us/new/top-charts',
@@ -37,14 +13,12 @@ const MAX_DEPTH = 4;
 const MAX_QUEUE_SIZE = 10000;
 const MAX_TRACKS_PER_ITEM = 500;
 
-// Tuned concurrency/pacing
 const MAX_BROWSERS = 4;
 const PARALLEL_PER_BROWSER = 2;
 const PAGE_TIMEOUT = 45000;
 const DELAY_BETWEEN_PAGES = 600;
 const NAV_RETRY_BACKOFF_MS = 2500;
 
-// Conservative throttle detector
 const THROTTLE_WINDOW_SIZE = 40;
 const THROTTLE_FAIL_THRESHOLD = 0.45;
 const THROTTLE_MIN_ATTEMPTS = 20;
@@ -108,7 +82,7 @@ function normalizeOutputItem(item) {
 
 class ThrottleDetector {
   constructor() {
-    this.outcomes = []; // true=success, false=fail
+    this.outcomes = [];
     this.cooldownUntil = 0;
   }
   record(ok) {
@@ -162,7 +136,6 @@ async function safeGoto(page, url, timeout = PAGE_TIMEOUT) {
 
 async function waitForAppleMusicAppReady(page) {
   await page.waitForTimeout(1500);
-
   const selectors = [
     '[data-testid="section-container"]',
     '[class*="headings__title"]',
@@ -170,14 +143,12 @@ async function waitForAppleMusicAppReady(page) {
     '[class*="shelf"]',
     '[class*="carousel"]',
   ];
-
   for (const sel of selectors) {
     try {
       await page.waitForSelector(sel, { timeout: 6000, state: 'attached' });
       return;
     } catch {}
   }
-
   await page.waitForTimeout(2500);
 }
 
@@ -219,24 +190,18 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
       };
     });
 
-    // find biggest vertical scroller and scroll it
     const movedStats = await page.evaluate(async () => {
       const delay = (ms) => new Promise(r => setTimeout(r, ms));
       const all = Array.from(document.querySelectorAll('*'));
 
       const vertical = all
         .filter(el => el.scrollHeight > el.clientHeight + 20)
-        .map(el => ({
-          el,
-          room: el.scrollHeight - el.clientHeight,
-          area: el.clientHeight * el.clientWidth
-        }))
+        .map(el => ({ el, room: el.scrollHeight - el.clientHeight, area: el.clientHeight * el.clientWidth }))
         .sort((a, b) => (b.room * 10 + b.area) - (a.room * 10 + a.area));
 
       let totalMoves = 0;
       let targetsUsed = 0;
 
-      // try top candidates (usually app-root scroller is near top of this sorted list)
       for (const candidate of vertical.slice(0, 8)) {
         const el = candidate.el;
         let stagnant = 0;
@@ -259,10 +224,8 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
         }
 
         totalMoves += movedOnThisEl;
-        // reset to top for consistent extraction behavior
         el.scrollTop = 0;
 
-        // if we found a working scroller, no need to brute-force all
         if (movedOnThisEl > 2) break;
       }
 
@@ -287,7 +250,6 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
     return;
   }
 
-  // horizontal branch unchanged logic style, but also container-first
   const before = await page.evaluate(() => {
     const all = Array.from(document.querySelectorAll('*'));
     const hEls = all.filter(el => el.scrollWidth > el.clientWidth + 20);
@@ -345,7 +307,12 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
         const arrowBox = await rightArrow.boundingBox();
         if (!arrowBox) break;
 
-        await page.mouse.move(Math.floor(arrowBox.x + arrowBox.width / 2), Math.floor(arrowBox.y + arrowBox.height / 2), { steps: 4 });
+        await page.mouse.move(
+          Math.floor(arrowBox.x + arrowBox.width / 2),
+          Math.floor(arrowBox.y + arrowBox.height / 2),
+          { steps: 4 }
+        );
+
         await rightArrow.click({ timeout: 900 });
         totalArrowClicks++;
         await page.waitForTimeout(220);
@@ -375,114 +342,6 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
       hScrollEls: hEls.length,
     };
   });
-
-  console.log(
-    `[DEBUG_SCROLL] dir=horizontal before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},hScrollEls=${before.hScrollEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},hScrollEls=${after.hScrollEls}) shelves=${shelfCount} centerHovers=${totalCenterHovers} rightEdgeMoves=${totalRightEdgeMoves} arrowClicks=${totalArrowClicks} fallbackMoves=${fallback.moved}/${fallback.total}`
-  );
-}
-    await page.evaluate(() => window.scrollTo(0, 0));
-
-    const after = await page.evaluate(() => ({
-      x: window.scrollX,
-      y: window.scrollY,
-      sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
-      sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
-      hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
-    }));
-
-    console.log(
-      `[DEBUG_SCROLL] dir=vertical before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},hScrollEls=${before.hScrollEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},hScrollEls=${after.hScrollEls})`
-    );
-    return;
-  }
-
-  const before = await page.evaluate(() => ({
-    x: window.scrollX,
-    y: window.scrollY,
-    sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
-    sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
-    hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
-  }));
-
-  const shelfSelector = '[data-testid*="section" i], [data-testid*="shelf" i], [class*="shelf" i], [class*="carousel" i], section, [role="region"]';
-  const shelves = page.locator(shelfSelector);
-  const shelfCount = await shelves.count();
-
-  let totalCenterHovers = 0;
-  let totalRightEdgeMoves = 0;
-  let totalArrowClicks = 0;
-
-  for (let i = 0; i < shelfCount; i++) {
-    const shelf = shelves.nth(i);
-    try {
-      await shelf.scrollIntoViewIfNeeded();
-      const box = await shelf.boundingBox();
-      if (!box || box.width < 200 || box.height < 60) continue;
-
-      const cx = Math.floor(box.x + box.width * 0.5);
-      const cy = Math.floor(box.y + box.height * 0.5);
-      await page.mouse.move(cx, cy, { steps: 8 });
-      totalCenterHovers++;
-      await page.waitForTimeout(120);
-
-      const rx = Math.floor(box.x + box.width - 8);
-      const ry = cy;
-      await page.mouse.move(rx, ry, { steps: 10 });
-      totalRightEdgeMoves++;
-      await page.waitForTimeout(120);
-
-      for (let k = 0; k < 10; k++) {
-        const rightArrow = shelf.locator(
-          [
-            'button[aria-label*="Next" i]',
-            'button[title*="Next" i]',
-            'button[aria-label*="more" i]',
-            '[data-testid*="next" i]',
-            'button[class*="next" i]',
-            '[class*="next" i] button',
-          ].join(', ')
-        ).first();
-
-        if (!(await rightArrow.count())) break;
-
-        const disabled = (await rightArrow.getAttribute('aria-disabled')) === 'true';
-        if (disabled) break;
-
-        const arrowBox = await rightArrow.boundingBox();
-        if (!arrowBox) break;
-
-        await page.mouse.move(Math.floor(box.x + box.width - 6), cy, { steps: 4 });
-        await page.mouse.move(
-          Math.floor(arrowBox.x + arrowBox.width / 2),
-          Math.floor(arrowBox.y + arrowBox.height / 2),
-          { steps: 4 }
-        );
-
-        await rightArrow.click({ timeout: 900 });
-        totalArrowClicks++;
-        await page.waitForTimeout(220);
-      }
-    } catch {}
-  }
-
-  const fallback = await page.evaluate(() => {
-    const els = Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20);
-    let moved = 0;
-    for (const el of els) {
-      const before = el.scrollLeft;
-      el.scrollLeft = Math.min(el.scrollLeft + Math.max(450, Math.floor(el.clientWidth * 0.9)), el.scrollWidth);
-      if (el.scrollLeft !== before) moved++;
-    }
-    return { total: els.length, moved };
-  });
-
-  const after = await page.evaluate(() => ({
-    x: window.scrollX,
-    y: window.scrollY,
-    sh: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
-    sw: Math.max(document.body?.scrollWidth || 0, document.documentElement?.scrollWidth || 0),
-    hScrollEls: Array.from(document.querySelectorAll('*')).filter(el => el.scrollWidth > el.clientWidth + 20).length,
-  }));
 
   console.log(
     `[DEBUG_SCROLL] dir=horizontal before(x=${before.x},y=${before.y},sh=${before.sh},sw=${before.sw},hScrollEls=${before.hScrollEls}) after(x=${after.x},y=${after.y},sh=${after.sh},sw=${after.sw},hScrollEls=${after.hScrollEls}) shelves=${shelfCount} centerHovers=${totalCenterHovers} rightEdgeMoves=${totalRightEdgeMoves} arrowClicks=${totalArrowClicks} fallbackMoves=${fallback.moved}/${fallback.total}`
@@ -566,24 +425,6 @@ async function extractLinksSectionsAndTracks(page, pageType = 'other') {
         });
       }
       if (items.length) r.sections.push({ name, items: dedupe(items) });
-    }
-
-    const featSections = document.querySelectorAll('[data-testid="section-container"][aria-label="Featured"]');
-    for (const sec of featSections) {
-      const cards = sec.querySelectorAll('[class*="lockup"], a[href*="/playlist/"], a[href*="/album/"], a[href*="/chart/"], a[href*="/room/"], a[href*="/multi-room/"]');
-      for (const c of cards) {
-        const linkEl = c.tagName === 'A' ? c : c.querySelector('a[href]');
-        const raw = linkEl?.href || '';
-        if (!raw.includes('music.apple.com')) continue;
-        const url = raw.split('?')[0].split('#')[0];
-        const title = c.querySelector('[class*="headings__title"], [class*="title"]')?.textContent?.trim() || '';
-        const subtitle = c.querySelector('[class*="headings__subtitles"]')?.textContent?.trim() || '';
-        const metadata = c.querySelector('[class*="headings__metadata-bottom"]')?.textContent?.trim() || '';
-        const description = c.querySelector('[class*="description"]')?.textContent?.trim() || '';
-        if (title && url) {
-          r.featuredItems.push({ name: title, url, type: typeOf(url), creator: subtitle, metadata, description });
-        }
-      }
     }
 
     if (pt !== 'album') {
@@ -870,15 +711,9 @@ async function main() {
           const totalTracks = items.reduce((s, i) => s + (i.tracks?.length || 0), 0);
           const ts = throttle.stats();
 
-          // Existing logs preserved
-          console.log(
-            `[PROGRESS] pages=${pageCount} queue=${queue.length}/${MAX_QUEUE_SIZE} items=${items.length} tracks=${totalTracks} failRate=${ts.failRate.toFixed(2)} (${ts.fails}/${ts.attempts})`
-          );
-          console.log(
-            `[SKIP-STATS] duplicateVisited=${state.skipStats.duplicateVisited} typeFiltered=${state.skipStats.typeFiltered} navFailed=${state.skipStats.navFailed} keepRuleRejected=${state.skipStats.keepRuleRejected} emptyContent=${state.skipStats.emptyContent} queueCapDropped=${state.skipStats.queueCapDropped}`
-          );
+          console.log(`[PROGRESS] pages=${pageCount} queue=${queue.length}/${MAX_QUEUE_SIZE} items=${items.length} tracks=${totalTracks} failRate=${ts.failRate.toFixed(2)} (${ts.fails}/${ts.attempts})`);
+          console.log(`[SKIP-STATS] duplicateVisited=${state.skipStats.duplicateVisited} typeFiltered=${state.skipStats.typeFiltered} navFailed=${state.skipStats.navFailed} keepRuleRejected=${state.skipStats.keepRuleRejected} emptyContent=${state.skipStats.emptyContent} queueCapDropped=${state.skipStats.queueCapDropped}`);
 
-          // Added multiline block
           console.log(`[DEBUG_PROGRESS_MULTI]`);
           console.log(`Pages Crawled: ${pageCount}`);
           console.log(`Queue: ${queue.length}/${MAX_QUEUE_SIZE}`);
@@ -902,11 +737,8 @@ async function main() {
         await page.close();
       }
 
-      if (!navOkForThrottle && throttle.inCooldown()) {
-        await sleep(Math.max(DELAY_BETWEEN_PAGES, 1200));
-      } else {
-        await sleep(DELAY_BETWEEN_PAGES);
-      }
+      if (!navOkForThrottle && throttle.inCooldown()) await sleep(Math.max(DELAY_BETWEEN_PAGES, 1200));
+      else await sleep(DELAY_BETWEEN_PAGES);
     }
   }
 
