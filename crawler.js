@@ -6,24 +6,20 @@ const { spawn } = require('child_process');
 
 /**
  * ============================================================
- * Apple Music US Crawler + Artist Pipeline (Updated)
+ * Apple Music US Crawler + Artist Pipeline (Fully Edited)
  * ============================================================
  *
- * Updated flow:
- *  1) Depth-1 crawl split into 3 workers (parallel)
- *  2) Each depth-1 worker emits depth-2 links, then split into 3 workers each => 9 depth-2 workers
- *  3) Merge crawl outputs
- *  4) Process BIG artist list in parallel workers
- *  5) Final merge (crawl + artists)
- *
- * Concurrency model per worker process:
- *  - 10 browsers
- *  - 5 parallel tasks per browser
- *  - 50 task loops total
- *
- * Filtering rule:
- *  - Keep item if page is artist OR subtitle contains "Apple Music"
- *  - For artist subpages: only process 1 subpage, and only keep if same rule
+ * Includes:
+ *  - Depth-1 split into 3 workers
+ *  - Depth-2 split into 9 workers (3x3)
+ *  - MAX_DEPTH = 2 for non-artist crawl
+ *  - MAX_QUEUE_SIZE = 10000
+ *  - Apple Music / Artist filtering rule
+ *  - MAX_SUBPAGES_PER_ARTIST = 1
+ *  - Scroll max halved (25)
+ *  - Robust navigation with safeGoto (domcontentloaded + fallback load)
+ *  - Longer timeout for stability/completeness
+ *  - Heartbeats + streamed child logs
  */
 
 const SEED_URLS = [
@@ -39,7 +35,7 @@ const MANDATORY_ARTISTS = [
   { name: 'SAILORR', url: 'https://music.apple.com/us/artist/sailorr/1741604584' },
 ];
 
-// Keep your existing full list here (unchanged)
+// Keep your full existing list
 const TOP_ARTISTS = [
   'Bruno Mars', 'Bad Bunny', 'The Weeknd', 'Rihanna', 'Taylor Swift',
   'Justin Bieber', 'Lady Gaga', 'Coldplay', 'Billie Eilish', 'Drake',
@@ -287,19 +283,19 @@ const TOP_ARTISTS = [
   'MONSTA X', 'TXT', 'ATEEZ', 'Joel Corry', 'Riton',
 ];
 
-const MAX_DEPTH = 2; // updated (non-artist crawl depth)
-const DEPTH1_SPLITS = 3; // updated
-const DEPTH2_SPLITS_PER_DEPTH1 = 3; // updated => total 9 depth-2 workers
+const MAX_DEPTH = 2;
+const DEPTH1_SPLITS = 3;
+const DEPTH2_SPLITS_PER_DEPTH1 = 3; // total depth2 workers = 9
 
 const ARTIST_WORKERS = 12;
 const MAX_BROWSERS = 10;
 const PARALLEL_PER_BROWSER = 5;
 const TOTAL_TASK_LOOPS = MAX_BROWSERS * PARALLEL_PER_BROWSER;
 
-const MAX_QUEUE_SIZE = 10000; // updated
+const MAX_QUEUE_SIZE = 10000;
 const MAX_TRACKS_PER_ITEM = 500;
-const MAX_SUBPAGES_PER_ARTIST = 1; // updated
-const PAGE_TIMEOUT = 30000;
+const MAX_SUBPAGES_PER_ARTIST = 1;
+const PAGE_TIMEOUT = 45000; // increased for better completeness
 const DELAY_BETWEEN_PAGES = 120;
 const HEARTBEAT_MS = 30000;
 
@@ -401,15 +397,32 @@ function startHeartbeat(label, getSnapshot) {
   return () => clearInterval(timer);
 }
 
+async function safeGoto(page, url, timeout = PAGE_TIMEOUT) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+    return true;
+  } catch {
+    try {
+      await page.goto(url, { waitUntil: 'load', timeout: timeout + 20000 });
+      return true;
+    } catch (e2) {
+      console.error(`safeGoto failed ${url}: ${e2.message}`);
+      return false;
+    }
+  }
+}
+
 async function scrollUntilExhausted(page, direction = 'vertical') {
   await page.evaluate(async (dir) => {
     const delay = 700;
-    const max = 25; // updated (halved from 50)
+    const max = 25;
     let last = dir === 'vertical' ? window.scrollY : window.scrollX;
     let same = 0;
+
     for (let i = 0; i < max; i++) {
-      if (dir === 'vertical') window.scrollBy(0, 900);
-      else {
+      if (dir === 'vertical') {
+        window.scrollBy(0, 900);
+      } else {
         const containers = document.querySelectorAll('[style*="overflow-x"], .shelf-grid, [class*="carousel"]');
         for (const c of containers) c.scrollBy({ left: 450, behavior: 'smooth' });
         window.scrollBy({ left: 450, top: 0, behavior: 'smooth' });
@@ -419,9 +432,12 @@ async function scrollUntilExhausted(page, direction = 'vertical') {
       if (cur === last) {
         same++;
         if (same >= 3) break;
-      } else same = 0;
+      } else {
+        same = 0;
+      }
       last = cur;
     }
+
     if (dir === 'vertical') window.scrollTo(0, 0);
   }, direction);
 }
@@ -468,7 +484,9 @@ async function extractLinksSectionsAndTracks(page) {
     for (const sec of sectionEls) {
       const name = sec.querySelector('h2, h3, [class*="title"]')?.textContent?.trim() || 'Section';
       const items = [];
-      const itemLinks = sec.querySelectorAll('a[href*="/album/"],a[href*="/playlist/"],a[href*="/artist/"],a[href*="/chart/"],a[href*="/room/"]');
+      const itemLinks = sec.querySelectorAll(
+        'a[href*="/album/"],a[href*="/playlist/"],a[href*="/artist/"],a[href*="/chart/"],a[href*="/room/"]'
+      );
       for (const l of itemLinks) {
         const u = l.href?.split('?')[0]?.split('#')[0];
         if (!u || !u.includes('music.apple.com')) continue;
@@ -479,7 +497,9 @@ async function extractLinksSectionsAndTracks(page) {
 
     const featSections = document.querySelectorAll('[data-testid="section-container"][aria-label="Featured"]');
     for (const sec of featSections) {
-      const cards = sec.querySelectorAll('[class*="lockup"], a[href*="/playlist/"], a[href*="/album/"], a[href*="/chart/"], a[href*="/room/"]');
+      const cards = sec.querySelectorAll(
+        '[class*="lockup"], a[href*="/playlist/"], a[href*="/album/"], a[href*="/chart/"], a[href*="/room/"]'
+      );
       for (const c of cards) {
         const linkEl = c.tagName === 'A' ? c : c.querySelector('a[href]');
         const raw = linkEl?.href || '';
@@ -489,7 +509,9 @@ async function extractLinksSectionsAndTracks(page) {
         const subtitle = c.querySelector('[class*="headings__subtitles"]')?.textContent?.trim() || '';
         const metadata = c.querySelector('[class*="headings__metadata-bottom"]')?.textContent?.trim() || '';
         const description = c.querySelector('[class*="description"]')?.textContent?.trim() || '';
-        if (title && url) r.featuredItems.push({ name: title, url, type: typeOf(url), creator: subtitle, metadata, description });
+        if (title && url) {
+          r.featuredItems.push({ name: title, url, type: typeOf(url), creator: subtitle, metadata, description });
+        }
       }
     }
 
@@ -497,7 +519,10 @@ async function extractLinksSectionsAndTracks(page) {
     let trackEls = [];
     for (const s of selectors) {
       const f = document.querySelectorAll(s);
-      if (f.length) { trackEls = Array.from(f); break; }
+      if (f.length) {
+        trackEls = Array.from(f);
+        break;
+      }
     }
     if (!trackEls.length) trackEls = Array.from(document.querySelectorAll('a[href*="/song/"]'));
 
@@ -512,7 +537,11 @@ async function extractLinksSectionsAndTracks(page) {
       if (!url || seen.has(url)) return;
       seen.add(url);
 
-      const name = (el.querySelector('[class*="title"],[class*="name"]')?.textContent?.trim() || el.textContent?.trim() || '').substring(0, 200);
+      const name = (
+        el.querySelector('[class*="title"],[class*="name"]')?.textContent?.trim() ||
+        el.textContent?.trim() ||
+        ''
+      ).substring(0, 200);
       if (!name) return;
 
       r.tracks.push({
@@ -530,7 +559,8 @@ async function extractLinksSectionsAndTracks(page) {
       const s = new Set();
       for (const x of a) {
         if (!x?.url || s.has(x.url)) continue;
-        s.add(x.url); o.push(x);
+        s.add(x.url);
+        o.push(x);
       }
       return o;
     }
@@ -541,7 +571,14 @@ async function extractLinksSectionsAndTracks(page) {
 
 async function crawlPage(page, url) {
   try {
-    await page.goto(url, { waitUntil: 'networkidle', timeout: PAGE_TIMEOUT });
+    const ok = await safeGoto(page, url);
+    if (!ok) {
+      return {
+        links: [], sections: [], tracks: [], featuredItems: [],
+        pageTitle: '', pageSubtitle: '', pageMetadata: '', pageDescription: '',
+      };
+    }
+
     await scrollUntilExhausted(page, 'vertical');
     await scrollUntilExhausted(page, 'horizontal');
     return await extractLinksSectionsAndTracks(page);
@@ -716,8 +753,11 @@ async function runQueueWithPool(initialQueue, state, browsers, workerLabel) {
 async function findArtistUrl(browser, artistName) {
   const page = await browser.newPage();
   try {
-    await page.goto(`https://music.apple.com/us/search?term=${encodeURIComponent(artistName)}`, { waitUntil: 'networkidle', timeout: PAGE_TIMEOUT });
+    const ok = await safeGoto(page, `https://music.apple.com/us/search?term=${encodeURIComponent(artistName)}`);
+    if (!ok) return null;
+
     await scrollUntilExhausted(page, 'vertical');
+
     return await page.evaluate((name) => {
       const links = document.querySelectorAll('a[href]');
       for (const l of links) {
@@ -736,11 +776,22 @@ async function findArtistUrl(browser, artistName) {
 async function processArtistPage(browser, artistName, artistUrl, visited) {
   const page = await browser.newPage();
   const artistData = {
-    name: artistName, url: artistUrl, type: 'artist', creator: artistName,
-    metadata: '', description: '', tracks: [], sections: [], featuredItems: [], subItems: [],
+    name: artistName,
+    url: artistUrl,
+    type: 'artist',
+    creator: artistName,
+    metadata: '',
+    description: '',
+    tracks: [],
+    sections: [],
+    featuredItems: [],
+    subItems: [],
   };
+
   try {
-    await page.goto(artistUrl, { waitUntil: 'networkidle', timeout: PAGE_TIMEOUT });
+    const ok = await safeGoto(page, artistUrl);
+    if (!ok) return artistData;
+
     await scrollUntilExhausted(page, 'vertical');
     await scrollUntilExhausted(page, 'horizontal');
 
@@ -760,16 +811,19 @@ async function processArtistPage(browser, artistName, artistUrl, visited) {
       }
     }
 
-    const toProcess = Array.from(subUrls).slice(0, MAX_SUBPAGES_PER_ARTIST); // 1
+    const toProcess = Array.from(subUrls).slice(0, MAX_SUBPAGES_PER_ARTIST);
     for (const subUrl of toProcess) {
       const sp = await browser.newPage();
       try {
-        await sp.goto(subUrl, { waitUntil: 'networkidle', timeout: PAGE_TIMEOUT });
+        const subOk = await safeGoto(sp, subUrl);
+        if (!subOk) continue;
+
         await scrollUntilExhausted(sp, 'vertical');
 
         const sd = await extractLinksSectionsAndTracks(sp);
         const subType = detectType(subUrl);
         const subSubtitle = sd.pageSubtitle || '';
+
         if (shouldKeepPage(subType, subSubtitle)) {
           artistData.subItems.push({
             name: sd.pageTitle || subUrl.split('/').pop() || 'Unknown',
@@ -804,6 +858,7 @@ function writeWorkflow(name, payload) {
   saveJson(file, payload);
   return file;
 }
+
 function writeOutput(name, items, meta = {}) {
   const unique = dedupeByUrl(items);
   const normalized = unique.map(normalizeOutputItem);
@@ -828,7 +883,10 @@ async function runWorker(workflowFile) {
 
   const workerLabel = wf.workerId || path.basename(workflowFile);
   const state = { visited: new Set(wf.visited || []), itemsByUrl: new Map() };
-  for (const si of wf.seedItems || []) if (si?.url) state.itemsByUrl.set(si.url, normalizeOutputItem(si));
+
+  for (const si of wf.seedItems || []) {
+    if (si?.url) state.itemsByUrl.set(si.url, normalizeOutputItem(si));
+  }
 
   const stopHeartbeat = startHeartbeat(`worker:${workerLabel}`, () => ({
     kind: wf.kind,
@@ -911,7 +969,11 @@ async function runWorker(workflowFile) {
         }
       }
     }
-    saveJson(wf.emitNextDepthLinksFile, { generatedAt: new Date().toISOString(), from: workerLabel, links: dedupeByUrl(next) });
+    saveJson(wf.emitNextDepthLinksFile, {
+      generatedAt: new Date().toISOString(),
+      from: workerLabel,
+      links: dedupeByUrl(next),
+    });
   }
 
   console.log(`[${workerLabel}] done -> ${outFile}`);
@@ -968,7 +1030,8 @@ async function runMerge(inputGlob, outFile) {
       else {
         const cur = byUrl.get(n.url);
         byUrl.set(n.url, {
-          ...cur, ...n,
+          ...cur,
+          ...n,
           tracks: (n.tracks.length > cur.tracks.length) ? n.tracks : cur.tracks,
           sections: (n.sections.length > cur.sections.length) ? n.sections : cur.sections,
           featuredItems: (n.featuredItems.length > cur.featuredItems.length) ? n.featuredItems : cur.featuredItems,
@@ -989,6 +1052,7 @@ async function runMerge(inputGlob, outFile) {
     items,
     sourceFiles: files.map(f => path.basename(f)),
   };
+
   saveJson(outFile, merged);
   console.log(`[merge] ${files.length} files -> ${outFile} (${items.length} items)`);
   return merged;
@@ -1000,14 +1064,14 @@ async function runOrchestrator() {
   console.log('========================================');
   console.log('Apple Music Orchestrator');
   console.log(`Per worker: ${MAX_BROWSERS} browsers, ${PARALLEL_PER_BROWSER} per browser (${TOTAL_TASK_LOOPS} loops)`);
-  console.log(`Flow: 3x depth1 -> 9x depth2 -> merge -> artist workers -> final merge`);
+  console.log('Flow: 3x depth1 -> 9x depth2 -> merge -> artist workers -> final merge');
   console.log('========================================');
 
   const totalWorkers = DEPTH1_SPLITS + (DEPTH1_SPLITS * DEPTH2_SPLITS_PER_DEPTH1) + ARTIST_WORKERS;
   const orchestratorState = { stage: 'starting', completedWorkers: 0, totalWorkers };
   const stopHeartbeat = startHeartbeat('orchestrator', () => orchestratorState);
 
-  // 1) Depth 1 split into 3 workers
+  // Stage 1: Depth 1 (3 workers)
   orchestratorState.stage = 'depth1';
   const seedSplits = splitArray(SEED_URLS.map(url => ({ url, depth: 1 })), DEPTH1_SPLITS);
 
@@ -1019,18 +1083,20 @@ async function runOrchestrator() {
       workerId: `depth1-w${i + 1}`,
       depth: 1,
       queue: seedSplits[i],
-      includeMandatoryArtists: i === 0, // include once
+      includeMandatoryArtists: i === 0,
       outputName: `us-depth1-w${i + 1}.json`,
       emitNextDepthLinksFile: workflowPath(`depth1-w${i + 1}-next-links.json`),
     }));
   }
 
-  await Promise.all(d1wfs.map((wf, i) =>
-    spawnNode(['--mode', 'worker', '--workflow', wf], path.join(LOG_DIR, `depth1-w${i + 1}.log`))
-      .then(() => { orchestratorState.completedWorkers += 1; })
-  ));
+  await Promise.all(
+    d1wfs.map((wf, i) =>
+      spawnNode(['--mode', 'worker', '--workflow', wf], path.join(LOG_DIR, `depth1-w${i + 1}.log`))
+        .then(() => { orchestratorState.completedWorkers += 1; })
+    )
+  );
 
-  // 2) Depth 2: each depth1 split into 3 => 9 workers
+  // Stage 2: Depth 2 (9 workers)
   orchestratorState.stage = 'depth2';
   const d2wfs = [];
   for (let i = 0; i < DEPTH1_SPLITS; i++) {
@@ -1050,18 +1116,20 @@ async function runOrchestrator() {
     }
   }
 
-  await Promise.all(d2wfs.map(wf => {
-    const id = path.basename(wf, '.json');
-    return spawnNode(['--mode', 'worker', '--workflow', wf], path.join(LOG_DIR, `${id}.log`))
-      .then(() => { orchestratorState.completedWorkers += 1; });
-  }));
+  await Promise.all(
+    d2wfs.map((wf) => {
+      const id = path.basename(wf, '.json');
+      return spawnNode(['--mode', 'worker', '--workflow', wf], path.join(LOG_DIR, `${id}.log`))
+        .then(() => { orchestratorState.completedWorkers += 1; });
+    })
+  );
 
-  // 3) Merge crawl-only
+  // Stage 3: Merge crawl outputs
   orchestratorState.stage = 'merge-crawl';
   const crawlMergedFile = path.join(DATA_DIR, 'us-crawl-only.json');
   await runMerge(path.join(OUTPUT_DIR, 'us-depth*.json'), crawlMergedFile);
 
-  // 4) Artist pipeline
+  // Stage 4: Artist workers
   orchestratorState.stage = 'artists';
   const artistSplits = splitArray(TOP_ARTISTS, ARTIST_WORKERS);
   const artistWfs = [];
@@ -1075,12 +1143,14 @@ async function runOrchestrator() {
     }));
   }
 
-  await Promise.all(artistWfs.map((wf, i) =>
-    spawnNode(['--mode', 'worker', '--workflow', wf], path.join(LOG_DIR, `artists-w${i + 1}.log`))
-      .then(() => { orchestratorState.completedWorkers += 1; })
-  ));
+  await Promise.all(
+    artistWfs.map((wf, i) =>
+      spawnNode(['--mode', 'worker', '--workflow', wf], path.join(LOG_DIR, `artists-w${i + 1}.log`))
+        .then(() => { orchestratorState.completedWorkers += 1; })
+    )
+  );
 
-  // 5) Final merge
+  // Stage 5: Final merge
   orchestratorState.stage = 'merge-final';
   await runMerge(path.join(OUTPUT_DIR, '*.json'), FINAL_OUTPUT);
 
